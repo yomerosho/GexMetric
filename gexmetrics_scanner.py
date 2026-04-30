@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 INDICES = ["SPY", "QQQ", "IWM", "DIA"]
 MAG7    = ["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA"]
-WATCHLIST = ["IWM", "QQQ", "SPY", "AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
+WATCHLIST = [ "AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
 
 # Combining all lists into one master list for the scanner
 ALL = list(set(INDICES + MAG7 + WATCHLIST))
