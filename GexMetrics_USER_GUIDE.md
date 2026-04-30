@@ -1,4 +1,4 @@
-# 🔮 Oracle — User Guide
+# 🔮 GexMetrics — User Guide
 ## Institutional Options Intelligence for Retail Traders
 
 ---
