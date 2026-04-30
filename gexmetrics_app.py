@@ -52,11 +52,20 @@ if scan_btn:
 tab1, tab2, tab3, tab4 = st.tabs(["GEX/VEX", "Whale Flow", "Contract Intel", "Portfolio"])
 
 with tab1:
-    if "gex_data" in st.session_state:
-        ticker = st.selectbox("Ticker", list(st.session_state.gex_data.keys()))
-        data = st.session_state.gex_data[ticker]
-        st.write(f"Spot: ${data['spot']:.2f}")
-        st.bar_chart(data['gex'].set_index('strike'))
+    if "gex_data" in st.session_state and st.session_state.gex_data:
+        ticker_list = list(st.session_state.gex_data.keys())
+        ticker = st.selectbox("Ticker", ticker_list)
+        
+        if ticker:
+            data = st.session_state.gex_data[ticker]
+            st.write(f"Spot: ${data['spot']:.2f}")
+            # Ensure the dataframe is formatted for the bar chart
+            if not data['gex'].empty:
+                st.bar_chart(data['gex'].set_index('strike'))
+            else:
+                st.warning("No GEX data available for this ticker.")
+    else:
+        st.info("Run the GexMetrics Scan from the sidebar to view analysis.")
 
 with tab2:
     if "whale_data" in st.session_state:
