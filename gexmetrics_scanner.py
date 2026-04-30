@@ -6,7 +6,7 @@ import time
 
 INDICES = ["SPY", "QQQ", "IWM", "DIA"]
 MAG7 = ["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA"]
-WATCHLIST = ["IWM", "QQQ", "SPY", "AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
+WATCHLIST = [ "AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
 ALL = list(set(INDICES + WATCHLIST))
 
 def _norm_cdf(x): return (1.0 + np.erf(x / np.sqrt(2.0))) / 2.0
