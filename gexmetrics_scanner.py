@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import time
 
 INDICES = ["SPY", "QQQ", "IWM", "DIA"]
 MAG7 = ["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA"]
@@ -28,10 +29,14 @@ class OptionsChainFetcher:
         self.ticker = ticker
         self.t = yf.Ticker(ticker)
         self.spot = self.t.info.get("regularMarketPrice") or self.t.info.get("currentPrice") or 0
+
     def get_chain(self, max_expiries=3):
         rows = []
         try:
             for exp in self.t.options[:max_expiries]:
+                # PAUSE FOR 1 SECOND BEFORE EACH REQUEST
+                time.sleep(1) 
+                
                 c = self.t.option_chain(exp)
                 for typ, df in [("call", c.calls), ("put", c.puts)]:
                     df = df.copy()
@@ -39,7 +44,9 @@ class OptionsChainFetcher:
                     df["premium"] = ((df["bid"]+df["ask"])/2) * df["volume"] * 100
                     rows.append(df)
             return pd.concat(rows)
-        except: return pd.DataFrame()
+        except Exception as e:
+            print(f"Error fetching {self.ticker}: {e}")
+            return pd.DataFrame()
 
 class GEXCalculator:
     def calculate(self, chain, spot):
