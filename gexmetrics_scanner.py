@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ── Tickers ───────────────────────────────────────────────────────────────────
 
 INDICES = ["SPY", "QQQ", "IWM", "DIA"]
-WATCHLIST = ["IWM", "QQQ", "SPY", "AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
+WATCHLIST = ["AAPL", "AMD", "AMZN", "ARM", "BABA", "COIN", "CRWV", "GOOGL", "NVDA", "TSLA", "TSLL", "JD", "HIMS", "HOOD", "IONQ", "IREN", "INTC", "LMND", "NBIS", "NFLX", "OKLO", "ORCL", "OXY", "PINS", "PLTR", "PYPL", "RBLX", "RDDT", "RKLB", "SOFI", "UNH", "WMT"]
 ALL     = INDICES + WATCHLIST
 
 WHALE_THRESHOLD = 500_000  # $500K premium minimum
