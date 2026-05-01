@@ -1,0 +1,4 @@
+# GexMetrics Daily Outlook — Email Subscribers
+# Format: email,name (one per line)
+
+yshobowa@gmail.com,Yomi
