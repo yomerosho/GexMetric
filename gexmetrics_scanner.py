@@ -71,30 +71,63 @@ class OptionsChainFetcher:
     def __init__(self, ticker):
         self.ticker = ticker
         self.t = yf.Ticker(ticker)
+        self.spot = self._get_spot()
+
+    def _get_spot(self):
+        # Try multiple methods to get spot price
         try:
             info = self.t.info
-            self.spot = (info.get("regularMarketPrice") or
-                         info.get("currentPrice") or
-                         info.get("previousClose") or 0)
-        except:
-            self.spot = 0
+            spot = (info.get("regularMarketPrice") or
+                    info.get("currentPrice") or
+                    info.get("previousClose") or 0)
+            if spot and spot > 0:
+                return float(spot)
+        except Exception as e:
+            logger.warning(f"{self.ticker} info failed: {e}")
+
+        # Fallback: use recent history
+        try:
+            hist = self.t.history(period="2d", interval="1d")
+            if not hist.empty:
+                return float(hist["Close"].iloc[-1])
+        except Exception as e:
+            logger.warning(f"{self.ticker} history failed: {e}")
+
+        return 0
 
     def get_chain(self, max_expiries=3):
         rows = []
         try:
-            for exp in self.t.options[:max_expiries]:
-                time.sleep(0.3)
-                c = self.t.option_chain(exp)
-                for typ, df in [("call", c.calls), ("put", c.puts)]:
-                    df = df.copy()
-                    df["option_type"] = typ
-                    df["expiry"]      = exp
-                    df["mid"]         = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
-                    df["premium"]     = df["mid"] * df["volume"].fillna(0) * 100
-                    rows.append(df)
-            return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+            options_list = self.t.options
+            if not options_list:
+                logger.warning(f"{self.ticker}: no options expiries available")
+                return pd.DataFrame()
+
+            for exp in list(options_list)[:max_expiries]:
+                try:
+                    time.sleep(0.5)  # Rate limit pause
+                    c = self.t.option_chain(exp)
+                    for typ, df in [("call", c.calls), ("put", c.puts)]:
+                        if df.empty: continue
+                        df = df.copy()
+                        df["option_type"] = typ
+                        df["expiry"]      = exp
+                        df["mid"]         = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
+                        df["premium"]     = df["mid"] * df["volume"].fillna(0) * 100
+                        rows.append(df)
+                except Exception as inner_e:
+                    logger.warning(f"{self.ticker} {exp}: {inner_e}")
+                    continue
+
+            if rows:
+                logger.info(f"{self.ticker}: fetched {len(rows)} expiry groups, spot=${self.spot:.2f}")
+                return pd.concat(rows, ignore_index=True)
+            else:
+                logger.warning(f"{self.ticker}: no chain data returned")
+                return pd.DataFrame()
+
         except Exception as e:
-            logger.debug(f"Error fetching {self.ticker}: {e}")
+            logger.error(f"{self.ticker} chain fetch failed: {e}")
             return pd.DataFrame()
 
 

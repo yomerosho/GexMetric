@@ -384,8 +384,15 @@ with tab1:
         </div>""", unsafe_allow_html=True)
     else:
         report = st.session_state.outlook
-        html   = build_outlook_html(report)
-        st.markdown(html, unsafe_allow_html=True)
+
+        # Strip outer html/body tags for Streamlit display (keep them for email)
+        full_html = build_outlook_html(report)
+        # Extract just the inner content
+        import re
+        m = re.search(r'<div style=\'max-width:900px[^>]*>(.+)</div>\s*</body>', full_html, re.DOTALL)
+        inner = m.group(1) if m else full_html
+
+        st.markdown(inner, unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════
