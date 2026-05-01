@@ -330,24 +330,40 @@ st.markdown("""
 # ── Generate Outlook ──────────────────────────────────────────────────────────
 
 if gen_btn:
-    outlook_engine = DailyOutlook()
-    with st.status("🔮 Generating outlook...", expanded=True) as status:
-        pb  = st.progress(0)
-        stx = st.empty()
+    try:
+        st.write(f"🔍 Starting scan with {len(sel_indices) + len(sel_mag7)} tickers...")
+        outlook_engine = DailyOutlook()
+        with st.status("🔮 Generating outlook...", expanded=True) as status:
+            pb  = st.progress(0)
+            stx = st.empty()
+            log = st.empty()
 
-        def cb(pct, msg):
-            pb.progress(pct)
-            stx.markdown(f"`{msg}`")
+            messages = []
+            def cb(pct, msg):
+                pb.progress(pct)
+                stx.markdown(f"`{msg}`")
+                messages.append(msg)
+                log.code("\n".join(messages[-15:]))
 
-        report = outlook_engine.generate(
-            indices=sel_indices, mag7=sel_mag7,
-            max_expiries=max_exp, whale_threshold=whale_thresh,
-            progress_cb=cb,
-        )
-        pb.empty(); stx.empty()
-        st.session_state.outlook  = report
-        st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
-        status.update(label="✅ Outlook generated!", state="complete")
+            report = outlook_engine.generate(
+                indices=sel_indices, mag7=sel_mag7,
+                max_expiries=max_exp, whale_threshold=whale_thresh,
+                progress_cb=cb,
+            )
+            pb.empty(); stx.empty()
+            st.session_state.outlook  = report
+            st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
+
+            ticker_count = len(report.get("tickers", {}))
+            if ticker_count == 0:
+                status.update(label=f"⚠️ Outlook generated but 0 tickers analyzed", state="error")
+                st.error("⚠️ No tickers were successfully analyzed. Check messages above.")
+            else:
+                status.update(label=f"✅ {ticker_count} tickers analyzed!", state="complete")
+    except Exception as e:
+        import traceback
+        st.error(f"❌ Scan failed: {type(e).__name__}: {str(e)}")
+        st.code(traceback.format_exc())
 
 # ── Email Outlook ─────────────────────────────────────────────────────────────
 

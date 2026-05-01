@@ -68,150 +68,75 @@ def days_to_expiry(exp_str):
 # ── Options Chain Fetcher ─────────────────────────────────────────────────────
 
 class OptionsChainFetcher:
+    """Diagnostic fetcher with verbose logging to identify what is failing."""
+
     def __init__(self, ticker):
         self.ticker = ticker
-        # Use curl_cffi with Chrome impersonation to bypass cloud IP blocks
+        self.t = yf.Ticker(ticker)
+        self.spot = 0
+        self._init_spot()
+
+    def _init_spot(self):
         try:
-            import curl_cffi.requests as cffi_requests
-            self.session = cffi_requests.Session(impersonate="chrome120")
-            self.t = yf.Ticker(ticker, session=self.session)
-        except Exception as e:
-            logger.warning(f"curl_cffi unavailable, using default session: {e}")
-            self.session = None
-            self.t = yf.Ticker(ticker)
-        self.spot = self._get_spot()
-
-    def _direct_api_chain(self, expiry_ts=None):
-        """Fallback: hit Yahoo's options API directly."""
-        try:
-            import requests
-            url = f"https://query1.finance.yahoo.com/v7/finance/options/{self.ticker}"
-            if expiry_ts:
-                url += f"?date={expiry_ts}"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-            if self.session:
-                r = self.session.get(url, headers=headers, timeout=10)
-            else:
-                r = requests.get(url, headers=headers, timeout=10)
-
-            if r.status_code != 200:
-                logger.warning(f"{self.ticker} direct API: status {r.status_code}")
-                return None
-            return r.json()
-        except Exception as e:
-            logger.warning(f"{self.ticker} direct API failed: {e}")
-            return None
-
-    def _get_spot(self):
-        # Try multiple methods to get spot price
-        try:
-            info = self.t.info
-            spot = (info.get("regularMarketPrice") or
-                    info.get("currentPrice") or
-                    info.get("previousClose") or 0)
-            if spot and spot > 0:
-                return float(spot)
-        except Exception as e:
-            logger.warning(f"{self.ticker} info failed: {e}")
-
-        # Fallback: use recent history
-        try:
-            hist = self.t.history(period="2d", interval="1d")
+            hist = self.t.history(period="2d", interval="1d", auto_adjust=True)
             if not hist.empty:
-                return float(hist["Close"].iloc[-1])
+                self.spot = float(hist["Close"].iloc[-1])
+                logger.info(f"{self.ticker}: spot=${self.spot:.2f}")
+            else:
+                logger.warning(f"{self.ticker}: history empty")
         except Exception as e:
-            logger.warning(f"{self.ticker} history failed: {e}")
-
-        return 0
+            logger.error(f"{self.ticker}: spot error: {e}")
 
     def get_chain(self, max_expiries=3):
-        rows = []
-
-        # Method 1: Try yfinance native (works locally, often fails on cloud)
+        # Just use yfinance native — print everything to logs
         try:
-            options_list = self.t.options
-            if options_list:
-                for exp in list(options_list)[:max_expiries]:
-                    try:
-                        time.sleep(0.3)
-                        c = self.t.option_chain(exp)
-                        for typ, df in [("call", c.calls), ("put", c.puts)]:
-                            if df.empty: continue
-                            df = df.copy()
-                            df["option_type"] = typ
-                            df["expiry"]      = exp
-                            df["mid"]         = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
-                            df["premium"]     = df["mid"] * df["volume"].fillna(0) * 100
-                            rows.append(df)
-                    except Exception as e:
-                        logger.warning(f"{self.ticker} {exp}: {e}")
-                        continue
+            logger.info(f"{self.ticker}: requesting options list...")
+            opts = self.t.options
+            logger.info(f"{self.ticker}: got options list type={type(opts).__name__} len={len(opts) if opts else 0}")
 
-                if rows:
-                    logger.info(f"{self.ticker}: yfinance native worked, {len(rows)} groups")
-                    return pd.concat(rows, ignore_index=True)
-        except Exception as e:
-            logger.warning(f"{self.ticker} yfinance native failed: {e}")
-
-        # Method 2: Direct Yahoo API fallback
-        logger.info(f"{self.ticker}: trying direct API fallback...")
-        data = self._direct_api_chain()
-        if not data:
-            logger.error(f"{self.ticker}: both methods failed")
-            return pd.DataFrame()
-
-        try:
-            opt_chain = data.get("optionChain", {}).get("result", [{}])[0]
-            expiry_dates = opt_chain.get("expirationDates", [])
-
-            if not expiry_dates:
-                logger.error(f"{self.ticker}: no expiry dates in API response")
+            if not opts:
+                logger.warning(f"{self.ticker}: options list is EMPTY")
                 return pd.DataFrame()
 
-            for exp_ts in expiry_dates[:max_expiries]:
+            rows = []
+            for i, exp in enumerate(list(opts)[:max_expiries]):
+                logger.info(f"{self.ticker}: fetching expiry {i+1}/{max_expiries}: {exp}")
                 try:
-                    time.sleep(0.4)
-                    exp_data = self._direct_api_chain(exp_ts)
-                    if not exp_data: continue
-                    options = exp_data.get("optionChain", {}).get("result", [{}])[0].get("options", [])
-                    if not options: continue
+                    time.sleep(0.5)
+                    chain = self.t.option_chain(exp)
+                    calls = chain.calls if hasattr(chain, "calls") else pd.DataFrame()
+                    puts  = chain.puts  if hasattr(chain, "puts")  else pd.DataFrame()
+                    logger.info(f"{self.ticker} {exp}: calls={len(calls)} puts={len(puts)}")
 
-                    exp_str = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d")
-                    chain_data = options[0]
-
-                    for typ_key, typ_label in [("calls", "call"), ("puts", "put")]:
-                        contracts = chain_data.get(typ_key, [])
-                        if not contracts: continue
-                        df = pd.DataFrame(contracts)
-                        df["option_type"] = typ_label
-                        df["expiry"]      = exp_str
-                        # Map field names to match yfinance schema
-                        if "openInterest" not in df.columns:
-                            df["openInterest"] = 0
-                        if "volume" not in df.columns:
-                            df["volume"] = 0
-                        if "impliedVolatility" not in df.columns:
-                            df["impliedVolatility"] = 0.3
-                        if "bid" not in df.columns: df["bid"] = 0
-                        if "ask" not in df.columns: df["ask"] = 0
-                        df["mid"]     = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
-                        df["premium"] = df["mid"] * df["volume"].fillna(0) * 100
+                    for typ, df in [("call", calls), ("put", puts)]:
+                        if df.empty: continue
+                        df = df.copy()
+                        df["option_type"] = typ
+                        df["expiry"]      = exp
+                        df["bid"]         = df.get("bid", 0).fillna(0)
+                        df["ask"]         = df.get("ask", 0).fillna(0)
+                        df["mid"]         = (df["bid"] + df["ask"]) / 2
+                        df["volume"]      = df.get("volume", 0).fillna(0)
+                        df["openInterest"]= df.get("openInterest", 0).fillna(0)
+                        df["impliedVolatility"] = df.get("impliedVolatility", 0.3).fillna(0.3)
+                        df["premium"]     = df["mid"] * df["volume"] * 100
                         rows.append(df)
-                except Exception as e:
-                    logger.warning(f"{self.ticker} expiry {exp_ts}: {e}")
+                except Exception as inner:
+                    logger.error(f"{self.ticker} {exp} fetch error: {type(inner).__name__}: {inner}")
 
             if rows:
-                logger.info(f"{self.ticker}: direct API worked, {len(rows)} groups, spot=${self.spot:.2f}")
-                return pd.concat(rows, ignore_index=True)
+                combined = pd.concat(rows, ignore_index=True)
+                logger.info(f"{self.ticker}: ✅ TOTAL {len(combined)} contracts")
+                return combined
             else:
+                logger.warning(f"{self.ticker}: no rows collected")
                 return pd.DataFrame()
+
         except Exception as e:
-            logger.error(f"{self.ticker} direct API parse failed: {e}")
+            logger.error(f"{self.ticker}: top-level error: {type(e).__name__}: {e}")
             return pd.DataFrame()
 
 
-# ── GEX Calculator (proper version) ───────────────────────────────────────────
 
 class GEXCalculator:
     """
