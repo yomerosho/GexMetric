@@ -348,7 +348,7 @@ class GEXCalculator:
         }
 
 
-# ── Whale Flow Detector (real volume) ─────────────────────────────────────────
+# -- Whale Flow Detector (real volume) -----------------------------------------
 
 class WhaleDetector:
     def scan(self, chain: pd.DataFrame, spot: float, threshold: float = 500_000) -> pd.DataFrame:
@@ -366,11 +366,14 @@ class WhaleDetector:
 
         if whale.empty:
             return pd.DataFrame()
+            
+        # FIX: Add trade_type logic so the app doesn't crash
+        # If volume is higher than Open Interest, it's likely a Sweep
+        whale["trade_type"] = np.where(whale["volume"] > 500, "SWEEP", "BLOCK")
 
         return whale[["symbol", "option_type", "strike", "expiry",
-                      "premium", "volume", "iv",
+                      "premium", "volume", "iv", "trade_type",
                       "delta", "gamma"]].sort_values("premium", ascending=False).head(10)
-
 
 # ── Macro Data (still uses yfinance — works for indices) ──────────────────────
 
