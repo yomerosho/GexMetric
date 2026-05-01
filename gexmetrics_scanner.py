@@ -119,17 +119,36 @@ class AlpacaOptionsClient:
         except: return None
 
 # ── Whale Detector ────────────────────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import requests
+import logging
+from datetime import datetime, timedelta
+
+# ... (Include your AlpacaOptionsClient and GEXCalculator here)
+
 class WhaleDetector:
     def scan(self, chain: pd.DataFrame, spot: float, threshold: float = 500_000) -> pd.DataFrame:
-        if chain.empty: return pd.DataFrame()
+        if chain.empty or spot == 0:
+            return pd.DataFrame()
+
         df = chain.copy()
         df["premium"] = df["mid"] * df["volume"] * 100
-        whale = df[(df["premium"] >= threshold) & (df["volume"] > 0)].copy()
-        if whale.empty: return pd.DataFrame()
-        
-        # FIX: Added trade_type logic to classify trades based on volume
+
+        whale = df[
+            (df["premium"] >= threshold) & 
+            (df["volume"] > 0)
+        ].copy()
+
+        if whale.empty:
+            return pd.DataFrame()
+            
+        # FIXED: Explicitly add trade_type so gexmetrics_app.py doesn't KeyError
         whale["trade_type"] = np.where(whale["volume"] > 500, "SWEEP", "BLOCK")
-        return whale.sort_values("premium", ascending=False).head(5)
+
+        return whale[["option_type", "strike", "expiry", "premium", "trade_type"]].sort_values("premium", ascending=False).head(10)
+
+# ... (Include the rest of your scanner classes)
 
 # ── Whale Magnet Detector ─────────────────────────────────────────────────────
 class WhaleMagnetDetector:
