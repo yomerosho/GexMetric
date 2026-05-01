@@ -70,8 +70,38 @@ def days_to_expiry(exp_str):
 class OptionsChainFetcher:
     def __init__(self, ticker):
         self.ticker = ticker
-        self.t = yf.Ticker(ticker)
+        # Use curl_cffi with Chrome impersonation to bypass cloud IP blocks
+        try:
+            import curl_cffi.requests as cffi_requests
+            self.session = cffi_requests.Session(impersonate="chrome120")
+            self.t = yf.Ticker(ticker, session=self.session)
+        except Exception as e:
+            logger.warning(f"curl_cffi unavailable, using default session: {e}")
+            self.session = None
+            self.t = yf.Ticker(ticker)
         self.spot = self._get_spot()
+
+    def _direct_api_chain(self, expiry_ts=None):
+        """Fallback: hit Yahoo's options API directly."""
+        try:
+            import requests
+            url = f"https://query1.finance.yahoo.com/v7/finance/options/{self.ticker}"
+            if expiry_ts:
+                url += f"?date={expiry_ts}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+            if self.session:
+                r = self.session.get(url, headers=headers, timeout=10)
+            else:
+                r = requests.get(url, headers=headers, timeout=10)
+
+            if r.status_code != 200:
+                logger.warning(f"{self.ticker} direct API: status {r.status_code}")
+                return None
+            return r.json()
+        except Exception as e:
+            logger.warning(f"{self.ticker} direct API failed: {e}")
+            return None
 
     def _get_spot(self):
         # Try multiple methods to get spot price
@@ -97,37 +127,87 @@ class OptionsChainFetcher:
 
     def get_chain(self, max_expiries=3):
         rows = []
+
+        # Method 1: Try yfinance native (works locally, often fails on cloud)
         try:
             options_list = self.t.options
-            if not options_list:
-                logger.warning(f"{self.ticker}: no options expiries available")
+            if options_list:
+                for exp in list(options_list)[:max_expiries]:
+                    try:
+                        time.sleep(0.3)
+                        c = self.t.option_chain(exp)
+                        for typ, df in [("call", c.calls), ("put", c.puts)]:
+                            if df.empty: continue
+                            df = df.copy()
+                            df["option_type"] = typ
+                            df["expiry"]      = exp
+                            df["mid"]         = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
+                            df["premium"]     = df["mid"] * df["volume"].fillna(0) * 100
+                            rows.append(df)
+                    except Exception as e:
+                        logger.warning(f"{self.ticker} {exp}: {e}")
+                        continue
+
+                if rows:
+                    logger.info(f"{self.ticker}: yfinance native worked, {len(rows)} groups")
+                    return pd.concat(rows, ignore_index=True)
+        except Exception as e:
+            logger.warning(f"{self.ticker} yfinance native failed: {e}")
+
+        # Method 2: Direct Yahoo API fallback
+        logger.info(f"{self.ticker}: trying direct API fallback...")
+        data = self._direct_api_chain()
+        if not data:
+            logger.error(f"{self.ticker}: both methods failed")
+            return pd.DataFrame()
+
+        try:
+            opt_chain = data.get("optionChain", {}).get("result", [{}])[0]
+            expiry_dates = opt_chain.get("expirationDates", [])
+
+            if not expiry_dates:
+                logger.error(f"{self.ticker}: no expiry dates in API response")
                 return pd.DataFrame()
 
-            for exp in list(options_list)[:max_expiries]:
+            for exp_ts in expiry_dates[:max_expiries]:
                 try:
-                    time.sleep(0.5)  # Rate limit pause
-                    c = self.t.option_chain(exp)
-                    for typ, df in [("call", c.calls), ("put", c.puts)]:
-                        if df.empty: continue
-                        df = df.copy()
-                        df["option_type"] = typ
-                        df["expiry"]      = exp
-                        df["mid"]         = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
-                        df["premium"]     = df["mid"] * df["volume"].fillna(0) * 100
+                    time.sleep(0.4)
+                    exp_data = self._direct_api_chain(exp_ts)
+                    if not exp_data: continue
+                    options = exp_data.get("optionChain", {}).get("result", [{}])[0].get("options", [])
+                    if not options: continue
+
+                    exp_str = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d")
+                    chain_data = options[0]
+
+                    for typ_key, typ_label in [("calls", "call"), ("puts", "put")]:
+                        contracts = chain_data.get(typ_key, [])
+                        if not contracts: continue
+                        df = pd.DataFrame(contracts)
+                        df["option_type"] = typ_label
+                        df["expiry"]      = exp_str
+                        # Map field names to match yfinance schema
+                        if "openInterest" not in df.columns:
+                            df["openInterest"] = 0
+                        if "volume" not in df.columns:
+                            df["volume"] = 0
+                        if "impliedVolatility" not in df.columns:
+                            df["impliedVolatility"] = 0.3
+                        if "bid" not in df.columns: df["bid"] = 0
+                        if "ask" not in df.columns: df["ask"] = 0
+                        df["mid"]     = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2)
+                        df["premium"] = df["mid"] * df["volume"].fillna(0) * 100
                         rows.append(df)
-                except Exception as inner_e:
-                    logger.warning(f"{self.ticker} {exp}: {inner_e}")
-                    continue
+                except Exception as e:
+                    logger.warning(f"{self.ticker} expiry {exp_ts}: {e}")
 
             if rows:
-                logger.info(f"{self.ticker}: fetched {len(rows)} expiry groups, spot=${self.spot:.2f}")
+                logger.info(f"{self.ticker}: direct API worked, {len(rows)} groups, spot=${self.spot:.2f}")
                 return pd.concat(rows, ignore_index=True)
             else:
-                logger.warning(f"{self.ticker}: no chain data returned")
                 return pd.DataFrame()
-
         except Exception as e:
-            logger.error(f"{self.ticker} chain fetch failed: {e}")
+            logger.error(f"{self.ticker} direct API parse failed: {e}")
             return pd.DataFrame()
 
 
