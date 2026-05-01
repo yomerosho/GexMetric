@@ -185,11 +185,12 @@ def build_outlook_html(report):
         for w in whales[:3]:
             wcol  = "#4af0c4" if w["option_type"] == "call" else "#f04a6a"
             wicon = "🟢" if w["option_type"] == "call" else "🔴"
+            # ADDED .get() fallbacks here to prevent KeyErrors
             whale_html += f"""<div style='font-family:monospace;font-size:0.74rem;color:#a0b0c0;padding:3px 0;'>
-                {wicon} <b style='color:{wcol};'>{w["option_type"].upper()}</b> ${w["strike"]:.0f}
-                <span style='color:#5a7a90;'>{w["expiry"]}</span> ·
-                <b style='color:#e0e8f0;'>${w["premium"]:,.0f}</b> ·
-                {w["trade_type"]}
+                {wicon} <b style='color:{wcol};'>{w.get("option_type", "N/A").upper()}</b> ${w.get("strike", 0):.0f}
+                <span style='color:#5a7a90;'>{w.get("expiry", "")}</span> ·
+                <b style='color:#e0e8f0;'>${w.get("premium", 0):, .0f}</b> ·
+                {w.get("trade_type", "FLOW")}
             </div>"""
         if not whale_html:
             whale_html = "<div style='color:#5a7a90;font-size:0.75rem;'>No whale flow detected.</div>"
