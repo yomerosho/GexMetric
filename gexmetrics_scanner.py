@@ -1,14 +1,16 @@
 """
-GexMetrics Scanner — Options Intelligence + Daily Outlook Engine
-================================================================
-Phase 1: Macro context, dealer positioning, earnings calendar
-Phase 2-4: Whale flow integration, catalyst scraper, multi-time emails
+GexMetrics Scanner — Powered by Alpaca Options API
+====================================================
+Real-time options chains with Greeks, OI, and Volume.
+Identifies whale magnetic levels (high gamma/OI strikes).
 """
 
-import yfinance as yf
+import os
+import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 import logging
 import time
 import warnings
@@ -24,370 +26,486 @@ MAG7      = ["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA"]
 WATCHLIST = INDICES + MAG7
 ALL       = WATCHLIST
 
-# Futures + macro proxies (yfinance symbols)
-MACRO = {
-    "VIX":   "^VIX",        # Volatility index
-    "DXY":   "DX-Y.NYB",    # Dollar index
-    "10Y":   "^TNX",        # 10-year yield
-    "Oil":   "CL=F",        # Crude oil futures
-    "Gold":  "GC=F",        # Gold futures
-    "ES":    "ES=F",        # S&P futures
-    "NQ":    "NQ=F",        # Nasdaq futures
-    "RTY":   "RTY=F",       # Russell futures
-}
+# ── Alpaca API Client ─────────────────────────────────────────────────────────
 
-# ── Black-Scholes Greeks ──────────────────────────────────────────────────────
+class AlpacaOptionsClient:
+    """
+    Direct REST client for Alpaca Options API.
+    Endpoints used:
+    - /v1beta1/options/snapshots/{underlying} — full chain with Greeks
+    - /v2/stocks/{symbol}/quotes/latest        — underlying spot
+    """
 
-def _norm_cdf(x):
-    return (1.0 + np.erf(x / np.sqrt(2.0))) / 2.0
+    BASE_URL = "https://data.alpaca.markets"
 
-def _norm_pdf(x):
-    return np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi)
+    def __init__(self, key=None, secret=None):
+        self.key    = key    or os.environ.get("ALPACA_KEY",    "")
+        self.secret = secret or os.environ.get("ALPACA_SECRET", "")
+        if not self.key or not self.secret:
+            logger.error("Alpaca API keys missing!")
 
-def bs_greeks(S, K, T, r, sigma, option_type="call"):
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "iv": sigma}
-    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if option_type.lower() == "call":
-        delta = _norm_cdf(d1)
-    else:
-        delta = _norm_cdf(d1) - 1
-    gamma = _norm_pdf(d1) / (S * sigma * np.sqrt(T))
-    return {"delta": round(delta,4), "gamma": round(gamma,6),
-            "theta": 0, "vega": 0, "iv": round(sigma,4)}
+    def _headers(self):
+        return {
+            "APCA-API-KEY-ID":     self.key,
+            "APCA-API-SECRET-KEY": self.secret,
+            "accept":              "application/json",
+        }
 
-
-def days_to_expiry(exp_str):
-    try:
-        return max((datetime.strptime(exp_str, "%Y-%m-%d") - datetime.now()).days / 365, 1/365)
-    except:
-        return 0.1
-
-
-# ── Options Chain Fetcher ─────────────────────────────────────────────────────
-
-class OptionsChainFetcher:
-    """Diagnostic fetcher with verbose logging to identify what is failing."""
-
-    def __init__(self, ticker):
-        self.ticker = ticker
-        self.t = yf.Ticker(ticker)
-        self.spot = 0
-        self._init_spot()
-
-    def _init_spot(self):
+    def get_spot(self, ticker: str) -> float:
+        """Get latest stock quote (mid of bid/ask)."""
         try:
-            hist = self.t.history(period="2d", interval="1d", auto_adjust=True)
-            if not hist.empty:
-                self.spot = float(hist["Close"].iloc[-1])
-                logger.info(f"{self.ticker}: spot=${self.spot:.2f}")
+            url = f"{self.BASE_URL}/v2/stocks/{ticker}/quotes/latest"
+            r = requests.get(url, headers=self._headers(), timeout=10)
+            if r.status_code == 200:
+                q = r.json().get("quote", {})
+                bid = q.get("bp", 0)
+                ask = q.get("ap", 0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2
+                return ask or bid
             else:
-                logger.warning(f"{self.ticker}: history empty")
+                logger.warning(f"{ticker} spot {r.status_code}: {r.text[:200]}")
         except Exception as e:
-            logger.error(f"{self.ticker}: spot error: {e}")
+            logger.error(f"{ticker} spot exception: {e}")
 
-    def get_chain(self, max_expiries=3):
-        # Just use yfinance native — print everything to logs
+        # Fallback to latest trade
         try:
-            logger.info(f"{self.ticker}: requesting options list...")
-            opts = self.t.options
-            logger.info(f"{self.ticker}: got options list type={type(opts).__name__} len={len(opts) if opts else 0}")
+            url = f"{self.BASE_URL}/v2/stocks/{ticker}/trades/latest"
+            r = requests.get(url, headers=self._headers(), timeout=10)
+            if r.status_code == 200:
+                return r.json().get("trade", {}).get("p", 0)
+        except:
+            pass
 
-            if not opts:
-                logger.warning(f"{self.ticker}: options list is EMPTY")
+        return 0
+
+    def get_option_chain(self, underlying: str,
+                          expiration_date_gte: str = None,
+                          expiration_date_lte: str = None,
+                          strike_pct_band: float = 0.10) -> pd.DataFrame:
+        """
+        Get full options chain snapshot for an underlying.
+        Returns DataFrame with: symbol, type, strike, expiration,
+        bid, ask, last, volume, open_interest, IV, delta, gamma, theta, vega
+        """
+        try:
+            url = f"{self.BASE_URL}/v1beta1/options/snapshots/{underlying}"
+            params = {"limit": 1000, "feed": "indicative"}
+
+            if expiration_date_gte:
+                params["expiration_date_gte"] = expiration_date_gte
+            if expiration_date_lte:
+                params["expiration_date_lte"] = expiration_date_lte
+
+            all_rows  = []
+            page_token = None
+
+            while True:
+                if page_token:
+                    params["page_token"] = page_token
+                r = requests.get(url, headers=self._headers(), params=params, timeout=15)
+
+                if r.status_code != 200:
+                    logger.error(f"{underlying} chain {r.status_code}: {r.text[:300]}")
+                    break
+
+                data = r.json()
+                snapshots = data.get("snapshots", {})
+
+                for symbol, snap in snapshots.items():
+                    parsed = self._parse_option_symbol(symbol)
+                    if not parsed:
+                        continue
+
+                    quote   = snap.get("latestQuote") or {}
+                    trade   = snap.get("latestTrade") or {}
+                    greeks  = snap.get("greeks") or {}
+                    iv      = snap.get("impliedVolatility") or 0
+
+                    bid = quote.get("bp") or 0
+                    ask = quote.get("ap") or 0
+
+                    all_rows.append({
+                        "symbol":           symbol,
+                        "underlying":       underlying,
+                        "option_type":      parsed["type"],
+                        "strike":           parsed["strike"],
+                        "expiry":           parsed["expiration"],
+                        "bid":              bid,
+                        "ask":              ask,
+                        "mid":              (bid + ask) / 2 if bid and ask else 0,
+                        "last":             trade.get("p") or 0,
+                        "volume":           trade.get("s") or 0,  # Latest trade size
+                        "delta":            greeks.get("delta", 0),
+                        "gamma":            greeks.get("gamma", 0),
+                        "theta":            greeks.get("theta", 0),
+                        "vega":             greeks.get("vega", 0),
+                        "iv":               iv,
+                    })
+
+                page_token = data.get("next_page_token")
+                if not page_token:
+                    break
+                time.sleep(0.1)
+
+            if not all_rows:
+                logger.warning(f"{underlying}: no options data returned")
                 return pd.DataFrame()
 
-            rows = []
-            for i, exp in enumerate(list(opts)[:max_expiries]):
-                logger.info(f"{self.ticker}: fetching expiry {i+1}/{max_expiries}: {exp}")
-                try:
-                    time.sleep(0.5)
-                    chain = self.t.option_chain(exp)
-                    calls = chain.calls if hasattr(chain, "calls") else pd.DataFrame()
-                    puts  = chain.puts  if hasattr(chain, "puts")  else pd.DataFrame()
-                    logger.info(f"{self.ticker} {exp}: calls={len(calls)} puts={len(puts)}")
-
-                    for typ, df in [("call", calls), ("put", puts)]:
-                        if df.empty: continue
-                        df = df.copy()
-                        df["option_type"] = typ
-                        df["expiry"]      = exp
-                        df["bid"]         = df.get("bid", 0).fillna(0)
-                        df["ask"]         = df.get("ask", 0).fillna(0)
-                        df["mid"]         = (df["bid"] + df["ask"]) / 2
-                        df["volume"]      = df.get("volume", 0).fillna(0)
-                        df["openInterest"]= df.get("openInterest", 0).fillna(0)
-                        df["impliedVolatility"] = df.get("impliedVolatility", 0.3).fillna(0.3)
-                        df["premium"]     = df["mid"] * df["volume"] * 100
-                        rows.append(df)
-                except Exception as inner:
-                    logger.error(f"{self.ticker} {exp} fetch error: {type(inner).__name__}: {inner}")
-
-            if rows:
-                combined = pd.concat(rows, ignore_index=True)
-                logger.info(f"{self.ticker}: ✅ TOTAL {len(combined)} contracts")
-                return combined
-            else:
-                logger.warning(f"{self.ticker}: no rows collected")
-                return pd.DataFrame()
+            df = pd.DataFrame(all_rows)
+            logger.info(f"{underlying}: ✅ fetched {len(df)} contracts")
+            return df
 
         except Exception as e:
-            logger.error(f"{self.ticker}: top-level error: {type(e).__name__}: {e}")
+            logger.error(f"{underlying} chain exception: {type(e).__name__}: {e}")
             return pd.DataFrame()
 
+    def get_open_interest(self, underlying: str) -> dict:
+        """
+        Get open interest for active option contracts.
+        Returns dict: {option_symbol: open_interest}
+        """
+        try:
+            # Use the trading API for OI data
+            url = "https://paper-api.alpaca.markets/v2/options/contracts"
+            params = {"underlying_symbols": underlying, "status": "active", "limit": 1000}
 
+            oi_map     = {}
+            page_token = None
+            pages      = 0
+
+            while pages < 10:  # Safety cap
+                if page_token:
+                    params["page_token"] = page_token
+
+                r = requests.get(url, headers=self._headers(), params=params, timeout=15)
+                if r.status_code != 200:
+                    logger.warning(f"{underlying} OI fetch {r.status_code}")
+                    break
+
+                data = r.json()
+                for c in data.get("option_contracts", []):
+                    sym = c.get("symbol")
+                    oi  = c.get("open_interest")
+                    if sym and oi is not None:
+                        try:
+                            oi_map[sym] = int(oi)
+                        except:
+                            pass
+
+                page_token = data.get("next_page_token")
+                if not page_token: break
+                pages += 1
+                time.sleep(0.1)
+
+            return oi_map
+        except Exception as e:
+            logger.error(f"{underlying} OI exception: {e}")
+            return {}
+
+    @staticmethod
+    def _parse_option_symbol(symbol: str) -> dict:
+        """
+        Parse OCC option symbol: e.g. AAPL250516C00200000
+        Format: SYMBOL + YYMMDD + C/P + STRIKE*1000 (8 digits)
+        """
+        try:
+            # Find where ticker ends — first digit is start of date
+            for i, ch in enumerate(symbol):
+                if ch.isdigit():
+                    ticker = symbol[:i]
+                    rest = symbol[i:]
+                    break
+            else:
+                return None
+
+            if len(rest) < 15:
+                return None
+
+            year   = "20" + rest[:2]
+            month  = rest[2:4]
+            day    = rest[4:6]
+            opt_t  = "call" if rest[6] == "C" else "put"
+            strike = int(rest[7:15]) / 1000.0
+
+            return {
+                "ticker":     ticker,
+                "expiration": f"{year}-{month}-{day}",
+                "type":       opt_t,
+                "strike":     strike,
+            }
+        except:
+            return None
+
+
+# ── Whale Magnet Detector ─────────────────────────────────────────────────────
+
+class WhaleMagnetDetector:
+    """
+    Identifies the strikes whales are magnetized to.
+    Logic: high gamma × high OI × close to spot = strong magnetic level.
+    Dealers must hedge these strikes most aggressively, creating gravitational pull.
+    """
+
+    def find_magnets(self, chain: pd.DataFrame, spot: float,
+                      oi_map: dict = None, top_n: int = 5) -> pd.DataFrame:
+        """
+        Returns top N magnetic strikes ranked by gamma × OI weighted impact.
+        """
+        if chain.empty:
+            return pd.DataFrame()
+
+        df = chain.copy()
+
+        # Add OI if we have it
+        if oi_map:
+            df["open_interest"] = df["symbol"].map(oi_map).fillna(0).astype(int)
+        else:
+            df["open_interest"] = 0
+
+        # Magnetic score: gamma × OI weighted by proximity to spot
+        df["distance_pct"] = abs(df["strike"] - spot) / spot
+        df["magnet_score"] = (
+            df["gamma"].abs() *
+            df["open_interest"].clip(lower=1) *
+            np.exp(-df["distance_pct"] * 5)  # Exponential decay with distance
+        )
+
+        # Aggregate by strike (sum across calls + puts)
+        by_strike = df.groupby("strike").agg(
+            total_gamma_oi=("magnet_score", "sum"),
+            call_oi=("open_interest", lambda x: x[df.loc[x.index, "option_type"] == "call"].sum()),
+            put_oi=("open_interest",  lambda x: x[df.loc[x.index, "option_type"] == "put"].sum()),
+            total_oi=("open_interest", "sum"),
+            avg_gamma=("gamma", "mean"),
+        ).reset_index()
+
+        by_strike["distance_pct"] = ((by_strike["strike"] - spot) / spot * 100).round(2)
+        by_strike["distance_$"]   = (by_strike["strike"] - spot).round(2)
+
+        # Sort by magnet score
+        by_strike = by_strike.sort_values("total_gamma_oi", ascending=False).head(top_n)
+
+        return by_strike[["strike", "distance_pct", "distance_$",
+                          "total_oi", "call_oi", "put_oi",
+                          "avg_gamma", "total_gamma_oi"]]
+
+
+# ── GEX Calculator (using REAL Greeks from Alpaca) ────────────────────────────
 
 class GEXCalculator:
     """
-    Real Gamma Exposure calculation using Black-Scholes gamma.
-    Positive GEX = dealers long gamma (stabilizing)
-    Negative GEX = dealers short gamma (amplifying)
+    Real Gamma Exposure using Alpaca's pre-calculated Greeks.
+    GEX per strike = gamma × OI × 100 × spot²× 0.01
+    Calls add to dealer GEX, puts subtract.
     """
 
-    def calculate(self, chain, spot, r=0.05):
+    def calculate(self, chain: pd.DataFrame, spot: float,
+                   oi_map: dict = None) -> pd.DataFrame:
         if chain.empty or spot == 0:
             return pd.DataFrame()
 
         df = chain.copy()
-        df["openInterest"] = df["openInterest"].fillna(0)
-        df["impliedVolatility"] = df["impliedVolatility"].fillna(0.3)
 
-        # Compute gamma for each contract
-        gammas = []
-        for _, row in df.iterrows():
-            T = days_to_expiry(row["expiry"])
-            iv = max(row["impliedVolatility"], 0.05)
-            g = bs_greeks(spot, row["strike"], T, r, iv, row["option_type"])
-            gammas.append(g["gamma"])
-        df["gamma_calc"] = gammas
+        if oi_map:
+            df["open_interest"] = df["symbol"].map(oi_map).fillna(0).astype(int)
+        else:
+            df["open_interest"] = 0
 
-        # GEX per contract: gamma × OI × 100 (contract size) × spot²×0.01
-        # Calls add to dealer gamma exposure, puts subtract
-        df["gex_contribution"] = np.where(
-            df["option_type"] == "call",
-             df["gamma_calc"] * df["openInterest"] * 100 * spot**2 * 0.01,
-            -df["gamma_calc"] * df["openInterest"] * 100 * spot**2 * 0.01
-        )
+        # GEX per contract
+        df["gex_per_contract"] = df["gamma"].abs() * df["open_interest"] * 100 * spot**2 * 0.01
+
+        # Call GEX is positive (dealers long gamma when long calls)
+        # Put GEX is negative
+        df["net_gex"] = np.where(df["option_type"] == "call",
+                                  df["gex_per_contract"],
+                                  -df["gex_per_contract"])
 
         # Aggregate by strike
-        result = df.groupby("strike").agg(
-            net_gex=("gex_contribution", "sum"),
-            total_oi=("openInterest", "sum"),
-            call_oi=("openInterest", lambda x: x[df.loc[x.index, "option_type"] == "call"].sum()),
-            put_oi=("openInterest", lambda x: x[df.loc[x.index, "option_type"] == "put"].sum()),
+        by_strike = df.groupby("strike").agg(
+            net_gex=("net_gex", "sum"),
+            total_oi=("open_interest", "sum"),
         ).reset_index()
-        result["net_gex"] = result["net_gex"].astype(float)
 
-        return result.sort_values("strike")
+        return by_strike.sort_values("strike")
 
-    def key_levels(self, gex_df, spot, n=3):
-        """Find top N positive (resistance) and negative (support) GEX strikes near spot."""
-        if gex_df.empty: return {"resistance": [], "support": [], "max_pain": spot}
+    def key_levels(self, gex_df: pd.DataFrame, spot: float, n: int = 3) -> dict:
+        if gex_df.empty:
+            return {"resistance": [], "support": [], "max_pos_gex": spot, "max_neg_gex": spot}
 
         nearby = gex_df[abs(gex_df["strike"] - spot) / spot <= 0.05].copy()
-        if nearby.empty: nearby = gex_df
+        if nearby.empty:
+            nearby = gex_df
 
-        # Resistance = highest positive GEX above spot
-        above = nearby[nearby["strike"] > spot].nlargest(n, "net_gex")["strike"].tolist()
-        # Support = highest positive GEX below spot
-        below = nearby[nearby["strike"] < spot].nlargest(n, "net_gex")["strike"].tolist()
+        above = nearby[nearby["strike"] > spot].nlargest(n, "net_gex")
+        below = nearby[nearby["strike"] < spot].nlargest(n, "net_gex")
 
         return {
-            "resistance": sorted(above)[:n],
-            "support": sorted(below, reverse=True)[:n],
+            "resistance":  sorted(above["strike"].tolist())[:n],
+            "support":     sorted(below["strike"].tolist(), reverse=True)[:n],
+            "max_pos_gex": float(gex_df.loc[gex_df["net_gex"].idxmax(), "strike"]) if not gex_df.empty else spot,
+            "max_neg_gex": float(gex_df.loc[gex_df["net_gex"].idxmin(), "strike"]) if not gex_df.empty else spot,
         }
 
 
-# ── Whale Detector (improved) ─────────────────────────────────────────────────
+# ── Whale Flow Detector (real volume) ─────────────────────────────────────────
 
 class WhaleDetector:
-    def scan(self, ticker, chain, spot, threshold=500_000):
+    def scan(self, chain: pd.DataFrame, spot: float, threshold: float = 500_000) -> pd.DataFrame:
         if chain.empty or spot == 0:
             return pd.DataFrame()
 
         df = chain.copy()
-        df["volume"]       = df["volume"].fillna(0)
-        df["openInterest"] = df["openInterest"].fillna(0)
-        df["vol_oi_ratio"] = df["volume"] / df["openInterest"].replace(0, np.nan)
+        df["premium"] = df["mid"] * df["volume"] * 100
 
-        # Filter: premium >= threshold AND within 10% of spot
         whale = df[
             (df["premium"] >= threshold) &
             (df["volume"] > 0) &
             (abs(df["strike"] - spot) / spot <= 0.10)
         ].copy()
 
-        if whale.empty: return pd.DataFrame()
+        if whale.empty:
+            return pd.DataFrame()
 
-        whale["trade_type"] = np.where(whale["vol_oi_ratio"] > 3, "🔥 SWEEP", "📦 BLOCK")
-        whale["bias"]       = np.where(whale["option_type"] == "call", "🟢 BULLISH", "🔴 BEARISH")
-        whale["Ticker"]     = ticker
-
-        return whale[["Ticker", "option_type", "strike", "expiry",
-                      "premium", "volume", "openInterest",
-                      "impliedVolatility", "trade_type", "bias"]].sort_values(
-            "premium", ascending=False).head(10)
+        return whale[["symbol", "option_type", "strike", "expiry",
+                      "premium", "volume", "iv",
+                      "delta", "gamma"]].sort_values("premium", ascending=False).head(10)
 
 
-# ── Macro Data Fetcher ────────────────────────────────────────────────────────
+# ── Macro Data (still uses yfinance — works for indices) ──────────────────────
 
 class MacroFetcher:
-    """Fetches VIX, DXY, 10Y yield, oil, gold, futures."""
+    SYMBOLS = {
+        "VIX":  "^VIX",
+        "DXY":  "DX-Y.NYB",
+        "10Y":  "^TNX",
+        "Oil":  "CL=F",
+        "Gold": "GC=F",
+        "ES":   "ES=F",
+        "NQ":   "NQ=F",
+        "RTY":  "RTY=F",
+    }
 
     def fetch_all(self):
+        import yfinance as yf
         result = {}
-        for label, symbol in MACRO.items():
+        for label, symbol in self.SYMBOLS.items():
             try:
-                t = yf.Ticker(symbol)
+                t    = yf.Ticker(symbol)
                 hist = t.history(period="5d", interval="1d", auto_adjust=True)
-                if hist.empty:
-                    continue
-                last  = float(hist["Close"].iloc[-1])
-                prev  = float(hist["Close"].iloc[-2]) if len(hist) > 1 else last
-                pct   = ((last - prev) / prev * 100) if prev > 0 else 0
+                if hist.empty: continue
+                last = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else last
+                pct  = ((last - prev) / prev * 100) if prev > 0 else 0
                 result[label] = {
-                    "value":   round(last, 2),
-                    "change":  round(last - prev, 2),
-                    "pct":     round(pct, 2),
-                    "trend":   "up" if last > prev else ("down" if last < prev else "flat"),
+                    "value":  round(last, 2),
+                    "change": round(last - prev, 2),
+                    "pct":    round(pct, 2),
+                    "trend":  "up" if last > prev else ("down" if last < prev else "flat"),
                 }
             except Exception as e:
                 logger.debug(f"Macro {label}: {e}")
         return result
 
 
-# ── Earnings Calendar ─────────────────────────────────────────────────────────
-
-class EarningsCalendar:
-    """Fetch upcoming earnings dates for a list of tickers."""
-
-    def fetch(self, tickers, days_ahead=14):
-        results = []
-        for ticker in tickers:
-            try:
-                t = yf.Ticker(ticker)
-                cal = t.calendar
-                if cal is None or (hasattr(cal, "empty") and cal.empty):
-                    continue
-                # yfinance returns either dict or DataFrame depending on version
-                date = None
-                if isinstance(cal, dict):
-                    date = cal.get("Earnings Date")
-                    if isinstance(date, list) and date:
-                        date = date[0]
-                else:
-                    try:
-                        date = cal.loc["Earnings Date"].iloc[0]
-                    except:
-                        pass
-
-                if date:
-                    if isinstance(date, str):
-                        try:
-                            date = datetime.strptime(date.split()[0], "%Y-%m-%d")
-                        except:
-                            continue
-                    # Convert to datetime
-                    if hasattr(date, "to_pydatetime"):
-                        date = date.to_pydatetime()
-                    days_until = (date - datetime.now()).days
-                    if 0 <= days_until <= days_ahead:
-                        results.append({
-                            "ticker":    ticker,
-                            "date":      date.strftime("%Y-%m-%d") if hasattr(date,"strftime") else str(date)[:10],
-                            "days":      days_until,
-                            "weekday":   date.strftime("%A") if hasattr(date,"strftime") else "—",
-                        })
-            except Exception as e:
-                logger.debug(f"Earnings {ticker}: {e}")
-        return sorted(results, key=lambda x: x["days"])
-
-
-# ── Daily Outlook Generator ───────────────────────────────────────────────────
+# ── Daily Outlook Engine ──────────────────────────────────────────────────────
 
 class DailyOutlook:
-    """Synthesizes macro + dealer positioning + flow into a directional bias report."""
+    def __init__(self, alpaca_key=None, alpaca_secret=None):
+        self.alpaca   = AlpacaOptionsClient(alpaca_key, alpaca_secret)
+        self.gex_calc = GEXCalculator()
+        self.whale    = WhaleDetector()
+        self.magnet   = WhaleMagnetDetector()
+        self.macro    = MacroFetcher()
 
-    def __init__(self):
-        self.macro_fetcher = MacroFetcher()
-        self.earnings      = EarningsCalendar()
-        self.gex_calc      = GEXCalculator()
-        self.whale_det     = WhaleDetector()
-
-    def generate(self, indices=INDICES, mag7=MAG7, max_expiries=3,
-                  whale_threshold=500_000, progress_cb=None):
+    def generate(self, indices=INDICES, mag7=MAG7,
+                  whale_threshold=500_000, days_out=30,
+                  progress_cb=None):
         report = {
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M ET"),
             "macro":        {},
-            "earnings":     [],
             "tickers":      {},
         }
 
-        # Macro
         if progress_cb: progress_cb(0.05, "Fetching macro data...")
-        report["macro"] = self.macro_fetcher.fetch_all()
+        report["macro"] = self.macro.fetch_all()
 
-        # Earnings (Mag7 only)
-        if progress_cb: progress_cb(0.15, "Loading earnings calendar...")
-        report["earnings"] = self.earnings.fetch(mag7, days_ahead=14)
-
-        # Per-ticker analysis
-        all_tickers = indices + mag7
+        all_tickers = list(set(indices + mag7))
         total       = len(all_tickers)
+
+        # Date range for options
+        today      = datetime.now().date()
+        date_start = today.isoformat()
+        date_end   = (today + timedelta(days=days_out)).isoformat()
 
         for idx, ticker in enumerate(all_tickers):
             if progress_cb:
-                progress_cb(0.15 + 0.85 * idx/total, f"Analyzing {ticker}...")
+                progress_cb(0.05 + 0.95 * idx/total, f"Analyzing {ticker}...")
 
             try:
-                fetcher = OptionsChainFetcher(ticker)
-                chain   = fetcher.get_chain(max_expiries=max_expiries)
-                spot    = fetcher.spot
-
-                if chain.empty or spot == 0:
+                # Get spot
+                spot = self.alpaca.get_spot(ticker)
+                if spot == 0:
+                    logger.warning(f"{ticker}: spot is 0, skipping")
                     continue
 
-                gex_df  = self.gex_calc.calculate(chain, spot)
-                levels  = self.gex_calc.key_levels(gex_df, spot, n=3)
-                whales  = self.whale_det.scan(ticker, chain, spot, whale_threshold)
+                # Get chain
+                chain = self.alpaca.get_option_chain(
+                    ticker,
+                    expiration_date_gte=date_start,
+                    expiration_date_lte=date_end,
+                )
+                if chain.empty:
+                    continue
 
-                # Determine bias
+                # Get OI map
+                oi_map = self.alpaca.get_open_interest(ticker)
+
+                # Compute GEX
+                gex_df = self.gex_calc.calculate(chain, spot, oi_map)
+                levels = self.gex_calc.key_levels(gex_df, spot)
+
+                # Magnetic levels
+                magnets = self.magnet.find_magnets(chain, spot, oi_map, top_n=5)
+
+                # Whale flow
+                whales = self.whale.scan(chain, spot, whale_threshold)
+
+                # Bias
                 bias = self._determine_bias(spot, levels, whales, report["macro"])
 
                 report["tickers"][ticker] = {
-                    "spot":      round(spot, 2),
-                    "levels":    levels,
-                    "bias":      bias,
-                    "whales":    whales.to_dict("records") if not whales.empty else [],
-                    "gex_total": float(gex_df["net_gex"].sum()) if not gex_df.empty else 0,
+                    "spot":        round(spot, 2),
+                    "levels":      levels,
+                    "magnets":     magnets.to_dict("records") if not magnets.empty else [],
+                    "whales":      whales.to_dict("records") if not whales.empty else [],
+                    "bias":        bias,
+                    "total_gex":   float(gex_df["net_gex"].sum()) if not gex_df.empty else 0,
+                    "chain_count": len(chain),
                 }
+
             except Exception as e:
-                logger.debug(f"Outlook {ticker}: {e}")
+                logger.error(f"{ticker} outlook error: {type(e).__name__}: {e}")
 
         return report
 
     def _determine_bias(self, spot, levels, whales, macro):
-        """Synthesize dealer levels + whale flow + macro → directional bias."""
-        score = 0  # +1 bullish, -1 bearish
+        score = 0
 
-        # Macro signal
         vix = macro.get("VIX", {})
         if vix.get("trend") == "down": score += 1
         if vix.get("trend") == "up":   score -= 1
 
-        # Whale signal
         if not whales.empty:
             calls = whales[whales["option_type"] == "call"]
             puts  = whales[whales["option_type"] == "put"]
-            cp_ratio = len(calls) / max(len(puts), 1)
-            if cp_ratio > 1.5: score += 1
-            if cp_ratio < 0.7: score -= 1
+            ratio = len(calls) / max(len(puts), 1)
+            if ratio > 1.5: score += 1
+            if ratio < 0.7: score -= 1
 
-        # Position relative to support/resistance
-        if levels["support"] and spot > levels["support"][0]:
+        if levels.get("support") and spot > levels["support"][0]:
             score += 0.5
-        if levels["resistance"] and spot >= levels["resistance"][0]:
+        if levels.get("resistance") and spot >= levels["resistance"][0]:
             score -= 0.5
 
         if score >= 1.5:
@@ -396,17 +514,3 @@ class DailyOutlook:
             return {"direction": "🔴 BEARISH", "score": score, "color": "#f04a6a"}
         else:
             return {"direction": "🟡 NEUTRAL", "score": score, "color": "#f5c842"}
-
-
-# ── Legacy class stubs for compatibility ──────────────────────────────────────
-
-class ContractIntelligence:
-    def max_pain(self, chain, spot): return spot
-    def summarize(self, chain, spot): return chain.head() if not chain.empty else pd.DataFrame()
-
-
-class PortfolioAnalyzer:
-    def analyze(self, pos): return pd.DataFrame()
-
-
-def portfolio_summary(df): return {}

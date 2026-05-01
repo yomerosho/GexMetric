@@ -17,8 +17,8 @@ from datetime import datetime
 import time
 
 from gexmetrics_scanner import (
-    OptionsChainFetcher, GEXCalculator, WhaleDetector,
-    MacroFetcher, EarningsCalendar, DailyOutlook,
+    AlpacaOptionsClient, GEXCalculator, WhaleDetector, WhaleMagnetDetector,
+    MacroFetcher, DailyOutlook,
     INDICES, MAG7, WATCHLIST, ALL,
 )
 
@@ -36,8 +36,10 @@ def get_secret(section, key, default=""):
     try:    return st.secrets[section][key]
     except: return default
 
-GMAIL_USER = get_secret("gmail", "user", "")
-GMAIL_PASS = get_secret("gmail", "password", "")
+GMAIL_USER    = get_secret("gmail", "user", "")
+GMAIL_PASS    = get_secret("gmail", "password", "")
+ALPACA_KEY    = get_secret("alpaca", "key", "")
+ALPACA_SECRET = get_secret("alpaca", "secret", "")
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 
@@ -164,6 +166,20 @@ def build_outlook_html(report):
         sup_html = " ".join([f"<span style='background:#0a1f18;color:#4af0c4;border-radius:6px;padding:3px 8px;margin:2px;font-family:monospace;font-size:0.75rem;'>${l:.2f}</span>"
                              for l in levels.get("support", [])]) or "<span style='color:#5a7a90;'>—</span>"
 
+        # Magnetic levels (the killer feature)
+        magnets_html = ""
+        for m in data.get("magnets", []):
+            dist = m.get("distance_pct", 0)
+            dist_lbl = f"+{dist:.2f}%" if dist > 0 else f"{dist:.2f}%"
+            dist_color = "#4af0c4" if dist > 0 else "#f04a6a"
+            magnets_html += f"""<div style='font-family:monospace;font-size:0.78rem;padding:5px 10px;background:#1a0d3a;border-left:2px solid #bc8cff;margin:3px 0;border-radius:0 6px 6px 0;'>
+                🧲 <b style='color:#bc8cff;'>${m["strike"]:.0f}</b>
+                <span style='color:{dist_color};'>({dist_lbl})</span>
+                <span style='color:#8090a0;font-size:0.72rem;'>· OI: {int(m.get("total_oi",0)):,}</span>
+            </div>"""
+        if not magnets_html:
+            magnets_html = "<div style='color:#5a7a90;font-size:0.75rem;'>No magnetic levels detected.</div>"
+
         # Top 3 whales
         whale_html = ""
         for w in whales[:3]:
@@ -191,6 +207,9 @@ def build_outlook_html(report):
 
           <div style='font-size:0.78rem;color:#5a7a90;margin-bottom:6px;font-family:monospace;'>SUPPORT BELOW</div>
           <div style='margin-bottom:14px;'>{sup_html}</div>
+
+          <div style='font-size:0.78rem;color:#5a7a90;margin-bottom:6px;font-family:monospace;'>🧲 WHALE MAGNETIC LEVELS (highest gamma × OI)</div>
+          <div style='margin-bottom:14px;'>{magnets_html}</div>
 
           <div style='font-size:0.78rem;color:#5a7a90;margin-bottom:6px;font-family:monospace;'>TOP WHALE FLOW</div>
           <div>{whale_html}</div>
@@ -292,7 +311,7 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     sel_indices = st.multiselect("Indices",  INDICES, default=INDICES)
     sel_mag7    = st.multiselect("Mag7",     MAG7,    default=MAG7)
-    max_exp     = st.slider("Expiries to scan", 1, 6, 3)
+    days_out    = st.slider("Days of expiries", 7, 60, 30)
     whale_thresh= st.number_input("Whale threshold ($)", value=500000, step=100000)
 
     st.markdown("---")
@@ -301,6 +320,11 @@ with st.sidebar:
 
     if st.session_state.last_run:
         st.caption(f"Last run: {st.session_state.last_run}")
+
+    if ALPACA_KEY and ALPACA_SECRET:
+        st.success("✅ Alpaca connected")
+    else:
+        st.error("❌ Alpaca keys missing in secrets")
 
     st.markdown("""
     <div style='margin-top:20px;font-size:0.7rem;color:#5a3a80;line-height:1.7;'>
@@ -332,7 +356,7 @@ st.markdown("""
 if gen_btn:
     try:
         st.write(f"🔍 Starting scan with {len(sel_indices) + len(sel_mag7)} tickers...")
-        outlook_engine = DailyOutlook()
+        outlook_engine = DailyOutlook(ALPACA_KEY, ALPACA_SECRET)
         with st.status("🔮 Generating outlook...", expanded=True) as status:
             pb  = st.progress(0)
             stx = st.empty()
@@ -347,7 +371,7 @@ if gen_btn:
 
             report = outlook_engine.generate(
                 indices=sel_indices, mag7=sel_mag7,
-                max_expiries=max_exp, whale_threshold=whale_thresh,
+                days_out=days_out, whale_threshold=whale_thresh,
                 progress_cb=cb,
             )
             pb.empty(); stx.empty()
@@ -428,14 +452,16 @@ with tab2:
         sel_t = st.selectbox("Select ticker", all_tickers, key="gex_deep")
 
         if sel_t:
-            # Recompute fresh GEX for the deep dive
-            with st.spinner(f"Loading {sel_t} chain..."):
-                fetcher = OptionsChainFetcher(sel_t)
-                chain   = fetcher.get_chain(max_expiries=max_exp)
-                spot    = fetcher.spot
+            with st.spinner(f"Loading {sel_t} chain from Alpaca..."):
+                client  = AlpacaOptionsClient(ALPACA_KEY, ALPACA_SECRET)
+                spot    = client.get_spot(sel_t)
+                chain   = client.get_option_chain(sel_t,
+                            expiration_date_gte=datetime.now().date().isoformat(),
+                            expiration_date_lte=(datetime.now().date() + pd.Timedelta(days=30)).isoformat())
+                oi_map  = client.get_open_interest(sel_t)
 
                 if not chain.empty:
-                    gex_df = GEXCalculator().calculate(chain, spot)
+                    gex_df = GEXCalculator().calculate(chain, spot, oi_map)
 
                     if not gex_df.empty:
                         # Filter to ±15% of spot
